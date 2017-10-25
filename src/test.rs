@@ -11,8 +11,8 @@ use syn::{self, Block, Constness, FnDecl, FunctionRetTy, Generics, Ident, Item, 
 use tempdir::TempDir;
 
 use Config;
-use error::*;
 use json::Document;
+use Result;
 
 /// The outcome of a documentation test.
 pub enum TestResult {
@@ -166,7 +166,7 @@ pub fn run_test(config: &Config, program: &str) -> Result<TestResult> {
         .args(&["--message-format", "json"])
         .output()?;
     if !output.status.success() {
-        bail!("cargo did not exit successfully: {}", output.status);
+        return Err(format_err!("cargo did not exit successfully: {}", output.status).into());
     }
 
     let output = String::from_utf8(output.stdout).expect("cargo did not output valid utf-8");

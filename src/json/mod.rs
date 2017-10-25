@@ -6,9 +6,10 @@ pub use self::api::*;
 
 use analysis::{AnalysisHost, DefKind};
 
-use error::*;
+use error;
 
 use std::collections::VecDeque;
+use Result;
 
 /// Creates the documentation from the given `AnalysisHost`.
 ///
@@ -27,7 +28,7 @@ pub fn create_documentation(host: &AnalysisHost, crate_name: &str) -> Result<Doc
     let id = roots.iter().find(|&&(_, ref name)| name == crate_name);
     let root_id = match id {
         Some(&(id, _)) => id,
-        _ => return Err(ErrorKind::CrateErr(crate_name.to_string()).into()),
+        _ => return Err(error::CrateErr { crate_name: crate_name.to_string() }.into()),
     };
 
     let root_def = host.get_def(root_id)?;
