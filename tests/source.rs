@@ -25,8 +25,9 @@
 
 extern crate rustdoc;
 
-#[macro_use] extern crate failure;
-#[macro_use] extern crate derive_fail;
+extern crate failure;
+#[macro_use]
+extern crate derive_fail;
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
@@ -42,13 +43,12 @@ extern crate tempdir;
 
 use std::fs::{self, File};
 use std::io::prelude::*;
-use std::io;
 use std::path::Path;
 use std::process::Command;
 
 use analysis::{AnalysisHost, Target};
 use analysis_data::config::Config as AnalysisConfig;
-use failure::{self, Error};
+use failure::{Error, ResultExt};
 use itertools::Itertools;
 use itertools::EitherOrBoth::{Both, Left, Right};
 use regex::Regex;
@@ -103,8 +103,8 @@ struct TestCase {
 
 /// Create analysis data from a given source file. Returns an analysis host with the data loaded.
 fn generate_analysis(source_file: &Path, tempdir: &Path) -> Result<AnalysisHost> {
-    let source_filename = source_file.to_str().ok_or_else(
-        || "Source filename contained invalid UTF-8",
+    let source_filename = source_file.to_str().ok_or(
+        failure::error_msg("Source filename contained invalid UTF-8")
     )?;
 
     let analysis_config = AnalysisConfig {
@@ -126,7 +126,7 @@ fn generate_analysis(source_file: &Path, tempdir: &Path) -> Result<AnalysisHost>
         ))
         .status()?;
     if !rustc_status.success() {
-        return failure::error_msg(format!("Compilation of {} failed", source_filename));
+        return Err(failure::error_msg(format!("Compilation of {} failed", source_filename)).into());
     }
 
     // rls-analysis expects the analysis files to be in a specific directory -- one usually created
@@ -177,7 +177,7 @@ fn check(source_file: &Path, host: &AnalysisHost) -> Result<()> {
     let package_name = source_file
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .ok_or_else(|| "Invalid source file stem")?;
+        .ok_or_else(|| failure::error_msg("Invalid source file stem"))?;
     let data = rustdoc::create_documentation(host, package_name)?;
     let json = serde_json::to_value(&data)?;
 
@@ -186,9 +186,9 @@ fn check(source_file: &Path, host: &AnalysisHost) -> Result<()> {
     let mut found_test = false;
     for (original_line_number, line) in join_line_continuations(&source) {
         if let Some(test_case) = parse_test(&line) {
-            run_test(&json, test_case?).chain_err(|| {
-                format!("test failed on line {}", original_line_number)
-            })?;
+            run_test(&json, test_case?).context(
+                failure::error_msg(format!("test failed on line {}", original_line_number))
+            )?;
             if !found_test {
                 found_test = true;
             }
@@ -196,7 +196,7 @@ fn check(source_file: &Path, host: &AnalysisHost) -> Result<()> {
     }
 
     if !found_test {
-        return failure::error_msg(format!("Found no tests in {}", source_file.display()));
+        return Err(failure::error_msg(format!("Found no tests in {}", source_file.display())).into());
     }
 
     Ok(())
@@ -290,18 +290,18 @@ fn parse_test(line: &str) -> Option<Result<TestCase>> {
 fn parse_directive(directive: &str, args: &str, negated: bool) -> Result<TestCase> {
     let args = match shlex::split(args) {
         Some(args) => args,
-        None => return failure::error_msg("Could not split directive arguments"),
+        None => return Err(failure::error_msg("Could not split directive arguments").into()),
     };
 
     match directive {
         "has" => {
             if args.len() != 2 {
-                return failure::error_msg("Not enough arguments");
+                return Err(failure::error_msg("Not enough arguments").into());
             }
 
             let pointer = &args[0];
             if !POINTER_RE.is_match(pointer) {
-                return failure::error_msg("Invalid JSON pointer syntax");
+                return Err(failure::error_msg("Invalid JSON pointer syntax").into());
             }
             let regex = Regex::new(&args[1])?;
 
@@ -312,7 +312,7 @@ fn parse_directive(directive: &str, args: &str, negated: bool) -> Result<TestCas
             })
         }
         _ => {
-            failure::error_msg("Unknown directive");
+            Err(failure::error_msg("Unknown directive").into())
         }
     }
 }
@@ -327,7 +327,7 @@ fn run_test(json: &serde_json::Value, case: TestCase) -> Result<()> {
     };
 
     let value = value.as_str().ok_or(
-        "The JSON pointer pointed at a type other than string",
+        failure::error_msg("The JSON pointer pointed at a type other than string"),
     )?;
 
     if case.regex.is_match(&value) && case.negated {
