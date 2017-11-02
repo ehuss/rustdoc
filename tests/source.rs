@@ -25,8 +25,8 @@
 
 extern crate rustdoc;
 
-#[macro_use]
-extern crate error_chain;
+#[macro_use] extern crate failure;
+#[macro_use] extern crate derive_fail;
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
@@ -48,51 +48,49 @@ use std::process::Command;
 
 use analysis::{AnalysisHost, Target};
 use analysis_data::config::Config as AnalysisConfig;
+use failure::{self, Error};
 use itertools::Itertools;
 use itertools::EitherOrBoth::{Both, Left, Right};
 use regex::Regex;
 use serde_json::Value;
 
+pub type Result<T> = std::result::Result<T, Error>;
+
 lazy_static! {
-    /// Matches valid JSON pointers.
-    static ref POINTER_RE: Regex = Regex::new(r"^(/(([^/~])|(~[01]))*)*$").unwrap();
+/// Matches valid JSON pointers.
+static ref POINTER_RE: Regex = Regex::new(r"^(/(([^/~])|(~[01]))*)*$").unwrap();
 }
 
-error_chain! {
-    foreign_links {
-        Analysis(analysis::AError);
-        Io(io::Error);
-        Json(serde_json::Error);
-        Regex(regex::Error);
-    }
+#[derive(Debug, Fail)]
+#[fail(display = "directive is not valid: {}", d)]
+struct InvalidDirective {
+    d: String,
+}
 
-    links {
-        Rustdoc(rustdoc::error::Error, rustdoc::error::ErrorKind);
-    }
+#[derive(Debug, Fail)]
+#[fail(display = "JSON pointer '{}' matched no data", p)]
+struct JsonPointer {
+    p: String,
+}
 
-    errors {
-        InvalidDirective(d: String) {
-            description("Directive is not valid")
-            display("Directive is not valid: {}", d)
-        }
-        JsonPointer(p: String) {
-            description("JSON pointer matched no data")
-            display("JSON pointer '{}' matched no data", p)
-        }
-        ValueMismatch(value: String, re: String) {
-            description("The value did not match the regular expression")
-            display("The value '{}' did not match the regular expression '{}'", value, re)
-        }
-        ValueType(value: Value) {
-            description("The JSON pointer did not point at a string")
-            display("The JSON pointer did not point at a string: {:?}", value)
-        }
-        UnexpectedPass(value: String, re: String) {
-            description("The value matched the regular expression, but it shouldn't")
-            display("The value '{}' matched the regular expression '{}' but it shouldn't",
-                    value, re)
-        }
-    }
+#[derive(Debug, Fail)]
+#[fail(display = "The value '{}' did not match the regular expression '{}'", value, re)]
+struct ValueMismatch {
+    value: String,
+    re: String,
+}
+
+#[derive(Debug, Fail)]
+#[fail(display = "The JSON pointer did not point at a string: {:?}", value)]
+struct ValueType {
+    value: Value,
+}
+
+#[derive(Debug, Fail)]
+#[fail(display = "The value '{}' matched the regular expression '{}' but it shouldn't", value, re)]
+struct UnexpectedPass {
+    value: String,
+    re: String,
 }
 
 // If more directives are added, this could be converted into an enum.
@@ -128,7 +126,7 @@ fn generate_analysis(source_file: &Path, tempdir: &Path) -> Result<AnalysisHost>
         ))
         .status()?;
     if !rustc_status.success() {
-        bail!("Compilation of {} failed", source_filename);
+        return failure::error_msg(format!("Compilation of {} failed", source_filename));
     }
 
     // rls-analysis expects the analysis files to be in a specific directory -- one usually created
@@ -198,7 +196,7 @@ fn check(source_file: &Path, host: &AnalysisHost) -> Result<()> {
     }
 
     if !found_test {
-        bail!("Found no tests in {}", source_file.display());
+        return failure::error_msg(format!("Found no tests in {}", source_file.display()));
     }
 
     Ok(())
@@ -282,7 +280,7 @@ fn parse_test(line: &str) -> Option<Result<TestCase>> {
     if let Some(caps) = DIRECTIVE_RE.captures(line) {
         let directive = &caps["directive"];
         let result = parse_directive(directive, &caps["args"], caps.name("negated").is_some())
-            .chain_err(|| ErrorKind::InvalidDirective(line.into()));
+            .context(InvalidDirective { d: line.into()});
         Some(result)
     } else {
         None
@@ -292,18 +290,18 @@ fn parse_test(line: &str) -> Option<Result<TestCase>> {
 fn parse_directive(directive: &str, args: &str, negated: bool) -> Result<TestCase> {
     let args = match shlex::split(args) {
         Some(args) => args,
-        None => bail!("Could not split directive arguments"),
+        None => return failure::error_msg("Could not split directive arguments"),
     };
 
     match directive {
         "has" => {
             if args.len() != 2 {
-                bail!("Not enough arguments");
+                return failure::error_msg("Not enough arguments");
             }
 
             let pointer = &args[0];
             if !POINTER_RE.is_match(pointer) {
-                bail!("Invalid JSON pointer syntax");
+                return failure::error_msg("Invalid JSON pointer syntax");
             }
             let regex = Regex::new(&args[1])?;
 
@@ -314,7 +312,7 @@ fn parse_directive(directive: &str, args: &str, negated: bool) -> Result<TestCas
             })
         }
         _ => {
-            bail!("Unknown directive");
+            failure::error_msg("Unknown directive");
         }
     }
 }
@@ -324,7 +322,7 @@ fn parse_directive(directive: &str, args: &str, negated: bool) -> Result<TestCas
 fn run_test(json: &serde_json::Value, case: TestCase) -> Result<()> {
     let value = match json.pointer(&case.pointer) {
         Some(value) => value,
-        None if !case.negated => return Err(ErrorKind::JsonPointer(case.pointer).into()),
+        None if !case.negated => return Err(JsonPointer{ p: case.pointer }.into()),
         None => return Ok(()),
     };
 
@@ -333,15 +331,15 @@ fn run_test(json: &serde_json::Value, case: TestCase) -> Result<()> {
     )?;
 
     if case.regex.is_match(&value) && case.negated {
-        bail!(ErrorKind::UnexpectedPass(
-            value.to_owned(),
-            case.regex.as_str().to_owned(),
-        ));
+        return Err(UnexpectedPass {
+            value: value.to_owned(),
+            re: case.regex.as_str().to_owned(),
+        }.into());
     } else if !case.regex.is_match(&value) && !case.negated {
-        bail!(ErrorKind::ValueMismatch(
-            value.to_owned(),
-            case.regex.as_str().to_owned(),
-        ));
+        return Err(ValueMismatch {
+            value: value.to_owned(),
+            re: case.regex.as_str().to_owned(),
+        }.into());
     } else {
         Ok(())
     }
@@ -359,9 +357,9 @@ mod tests {
 
     macro_rules! assert_err {
         ($err:expr, $kind:path) => {
-            match *($err).kind() {
-                $kind(..) => (),
-                ref kind => panic!("unexpected error kind: {:?}", kind),
+            match ($err).downcast::<$kind>() {
+                Ok(_) => (),
+                Err(error) => panic!("unexpected error kind: {:?}", error)
             }
         }
     }
@@ -430,17 +428,17 @@ mod tests {
         assert!(super::parse_test(r#"fn main() { println!("no test case"); }"#).is_none());
 
         let err = super::parse_test("// @has /test '['").unwrap().unwrap_err();
-        assert_err!(err, ErrorKind::InvalidDirective);
+        assert_err!(err, InvalidDirective);
 
         let err = super::parse_test("// @garbage /test 'abc'")
             .unwrap()
             .unwrap_err();
-        assert_err!(err, ErrorKind::InvalidDirective);
+        assert_err!(err, InvalidDirective);
 
         let err = super::parse_test("// @has /inval~~id 'pointer'")
             .unwrap()
             .unwrap_err();
-        assert_err!(err, ErrorKind::InvalidDirective);
+        assert_err!(err, InvalidDirective);
     }
 
     #[test]
@@ -484,7 +482,7 @@ mod tests {
                 negated: true,
             },
         ).unwrap_err();
-        assert_err!(err, ErrorKind::UnexpectedPass);
+        assert_err!(err, UnexpectedPass);
 
         let err = super::run_test(
             &json,
@@ -494,7 +492,7 @@ mod tests {
                 negated: false,
             },
         ).unwrap_err();
-        assert_err!(err, ErrorKind::ValueMismatch);
+        assert_err!(err, ValueMismatch);
 
         let err = super::run_test(
             &json,
@@ -504,6 +502,6 @@ mod tests {
                 negated: false,
             },
         ).unwrap_err();
-        assert_err!(err, ErrorKind::JsonPointer);
+        assert_err!(err, JsonPointer);
     }
 }
